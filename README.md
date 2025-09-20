@@ -34,3 +34,7 @@ System Flow:
 5- Smooth predictions with buffer
 6- Combine multi-step signs into full words
 7- Display on screen + speak aloud
+
+This code does not train a model.
+It only loads an already trained .h5 model and uses it for real-time ASL sign detection.
+If you need to train a model, you must prepare a dataset and write a separate training script.
