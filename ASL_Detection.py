@@ -1,273 +1,220 @@
-from flask import Flask, render_template, request
-from flask_socketio import SocketIO, emit
-import numpy as np
-import base64
 import cv2
-from tensorflow.keras.models import load_model
-from tensorflow.keras.preprocessing.image import img_to_array
-import json
-import time
 from cvzone.HandTrackingModule import HandDetector
+import numpy as np
+import tensorflow.keras as keras
+import time
+from collections import deque
+import pyttsx3
+import threading
 
-app = Flask(__name__)
-app.config['SECRET_KEY'] = 'your-secret-key-here'
-socketio = SocketIO(app, cors_allowed_origins="*", logger=True, engineio_logger=True)
+# Initialize webcam and detector
+cap = cv2.VideoCapture(0)
+if not cap.isOpened():
+    print("Error: Could not open webcam")
+    raise SystemExit
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+detector = HandDetector(maxHands=2, detectionCon=0.7)
+offset = 20
+imgSize = 300
 
-# Initialize HandDetector with tuned parameters
-detector = HandDetector(maxHands=2, detectionCon=0.8, minTrackCon=0.7)
-
-# Load your trained model
+# Load the trained model
+model_path = r"D:\Vision\GradProjrct\asl_model_300x300_1.h5" 
 try:
-    model = load_model("C:/Users/mrmoh/Desktop/app/Backend/asl.h5")
-    print("✅ Model loaded successfully")
-    print("Model summary:")
-    print(model.summary())
+    model = keras.models.load_model(model_path)
 except Exception as e:
-    print(f"❌ Error loading model: {e}")
-    model = None
+    print(f"Error loading model: {e}")
+    raise SystemExit
 
-class_names = ['done1', 'done2', 'forget1', 'forget2', 'happy', 'help', 'hi', 'how are', 'i', 'love', 'need', 'nice', 'to meet', 'you']
+# Define labels
+labels = ['done1', 'done2', 'forget1', 'forget2', 'happy', 'help', 'hi', 'how are', 'i', 'love', 'need', 'nice', 'to meet', 'you']
 
-# Store connected clients
-connected_clients = {}
+# Prediction buffer and sequence tracking
+prediction_buffer = deque(maxlen=5)
+sequence_history = deque(maxlen=50)
+sequence_timeout = 2.0
+predicted_labels = []  # Store unique predicted labels
 
-def preprocess_image(img, x, y, w, h, imgSize=300, offset=20):
-    """Preprocess hand image for model prediction"""
+# Initialize text-to-speech
+engine = pyttsx3.init()
+engine.setProperty('rate', 180)  # Increase speech rate for faster delivery
+engine.setProperty('volume', 1.0)
+
+def speak_labels(labels_list):
+    """Run speech for a list of labels as a single continuous phrase."""
+    print(f"Speaking labels: {labels_list}")  # Debug print
+    # Concatenate labels into a single string with minimal spacing
+    combined_text = " ".join(labels_list).replace("  ", " ")  # Ensure single spaces
+    engine.say(combined_text)
+    engine.runAndWait()
+
+def preprocess_image(img, x, y, w, h, imgSize, offset):
+    imgCrop = img[max(0, y - offset):y + h + offset, max(0, x - offset):x + w + offset]
+    if imgCrop.size == 0:
+        return None
+    imgWhite = np.ones((imgSize, imgSize, 3), np.uint8) * 255
     try:
-        # Crop hand region with offset
-        imgCrop = img[max(0, y - offset):y + h + offset, max(0, x - offset):x + w + offset]
-        if imgCrop.size == 0:
-            print("Error: Empty cropped image")
-            return None
-
-        # Calculate aspect ratio and resize while preserving it
         aspectRatio = h / w
-        imgWhite = np.ones((imgSize, imgSize, 3), np.uint8) * 255
         if aspectRatio > 1:
-            # Height > Width: Fit to height, center horizontally
             k = imgSize / h
-            wCal = min(int(w * k), imgSize)  # Ensure width doesn't exceed imgSize
+            wCal = int(w * k)
+            if wCal > imgSize:
+                wCal = imgSize
+                k = imgSize / w
             imgResize = cv2.resize(imgCrop, (wCal, imgSize))
             wGap = (imgSize - wCal) // 2
-            imgWhite[:, wGap:wGap + wCal] = imgResize
+            imgWhite[:, wGap:wGap + wCal] = imgResize[:, :wCal]
         else:
-            # Width >= Height: Fit to width, center vertically
             k = imgSize / w
-            hCal = min(int(h * k), imgSize)  # Ensure height doesn't exceed imgSize
+            hCal = int(h * k)
+            if hCal > imgSize:
+                hCal = imgSize
+                k = imgSize / h
             imgResize = cv2.resize(imgCrop, (imgSize, hCal))
             hGap = (imgSize - hCal) // 2
-            imgWhite[hGap:hGap + hCal, :] = imgResize
-
-        # Save processed image for debugging (first few frames)
-        if not hasattr(preprocess_image, 'save_count'):
-            preprocess_image.save_count = 0
-        if preprocess_image.save_count < 5:  # Save first 5 processed images
-            cv2.imwrite(f"debug_processed_hand_{preprocess_image.save_count}.jpg", imgWhite)
-            print(f"Saved debug image: debug_processed_hand_{preprocess_image.save_count}.jpg")
-            preprocess_image.save_count += 1
-
+            imgWhite[hGap:hGap + hCal, :] = imgResize[:hCal, :]
         return imgWhite
     except Exception as e:
         print(f"Error preprocessing: {e}")
         return None
 
-def preprocess_hand(hand_img):
-    """Preprocess hand image for model prediction"""
-    try:
-        hand_img = hand_img.astype(np.float32) / 255.0
-        hand_img = img_to_array(hand_img)
-        hand_img = np.expand_dims(hand_img, axis=0)
-        return hand_img
-    except Exception as e:
-        print(f"Error in preprocessing: {e}")
-        return None
+try:
+    prev_time = time.time()
+    last_predicted_label = None
+    min_time_gap = 1.0
+    last_prediction_time = 0.0
+    displayed_text = ""
+    was_hand_detected = False
+    no_hand_start_time = None  # Track when no hands are first detected
+    no_hand_delay = 1.0  # Require 1 second of no hands before speaking
 
-def detect_hands(frame):
-    """Detect hands using cvzone HandDetector with frame preprocessing"""
-    try:
-        # Ensure frame is in BGR format
-        if frame.shape[2] != 3:
-            print("Invalid frame: Expected 3 channels (BGR)")
-            return None, None, 0
-        frame = cv2.cvtColor(frame, cv2.COLOR_RGB2BGR)  # Convert RGB to BGR if needed
-        
-        # Adjust brightness and contrast
-        alpha = 1.2  # Contrast control (1.0-3.0)
-        beta = 10    # Brightness control (0-100)
-        frame = cv2.convertScaleAbs(frame, alpha=alpha, beta=beta)
-        
-        # Log frame properties
-        print(f"Frame shape: {frame.shape}, dtype: {frame.dtype}, mean pixel: {np.mean(frame):.1f}, min: {np.min(frame)}, max: {np.max(frame)}")
-        
-        # Save a sample frame with bounding boxes for inspection
-        debug_frame = frame.copy()
-        hands, _ = detector.findHands(frame, draw=False)  # Disable drawing on main frame
+    while True:
+        success, img = cap.read()
+        if not success:
+            print("Failed to capture image")
+            break
+        hands, img = detector.findHands(img)
+        hand_count = len(hands)
+        info = f"Hands detected: {hand_count}"
+
         if hands:
-            if len(hands) == 1:
+            imgWhite = None
+            if hand_count == 1:
                 hand = hands[0]
                 x, y, w, h = hand['bbox']
-                score = hand.get('score', [0.0])[0] if 'score' in hand else 0.0
-                print(f"Single hand detected: x={x}, y={y}, w={w}, h={h}, confidence={score:.2f}")
-                # Draw bounding box on debug frame
-                cv2.rectangle(debug_frame, (x, y), (x + w, y + h), (0, 255, 0), 2)
-            else:  # Two hands
+                imgWhite = preprocess_image(img, x, y, w, h, imgSize, offset)
+                info += " (1 hand)"
+            elif hand_count == 2:
                 x1, y1, w1, h1 = hands[0]['bbox']
                 x2, y2, w2, h2 = hands[1]['bbox']
-                x = min(x1, x2)
-                y = min(y1, y2)
-                w = max(x1 + w1, x2 + w2) - x
-                h = max(y1 + h1, y2 + h2) - y
-                scores = [hand.get('score', [0.0])[0] for hand in hands]
-                print(f"Two hands detected: combined bbox x={x}, y={y}, w={w}, h={h}, confidences={scores}")
-                # Draw bounding boxes on debug frame
-                cv2.rectangle(debug_frame, (x1, y1), (x1 + w1, y1 + h1), (0, 255, 0), 2)
-                cv2.rectangle(debug_frame, (x2, y2), (x2 + w2, y2 + h2), (0, 255, 0), 2)
-            hand_roi = preprocess_image(frame, x, y, w, h, imgSize=300, offset=20)
-            if hand_roi is None:
-                print("No valid hand ROI")
-                return None, None, 0
-            print(f"Hand ROI shape: {hand_roi.shape}")
-            
-            # Save debug frame with bounding boxes (first few frames)
-            if not hasattr(detect_hands, 'frame_count'):
-                detect_hands.frame_count = 0
-            if detect_hands.frame_count < 5:  # Save first 5 frames
-                cv2.imwrite(f"debug_frame_with_bbox_{detect_hands.frame_count}.jpg", debug_frame)
-                print(f"Saved debug frame: debug_frame_with_bbox_{detect_hands.frame_count}.jpg")
-                detect_hands.frame_count += 1
-                
-            return hand_roi, (x, y, w, h), w * h
-        print("No hands detected")
-        return None, None, 0
-    except Exception as e:
-        print(f"Error in hand detection: {e}")
-        return None, None, 0
+                x_min = min(x1, x2)
+                y_min = min(y1, y2)
+                x_max = max(x1 + w1, x2 + w2)
+                y_max = max(y1 + h1, y2 + h2)
+                x = x_min
+                y = y_min
+                w = x_max - x_min
+                h = y_max - y_min
+                imgWhite = preprocess_image(img, x, y, w, h, imgSize, offset)
+                info += " (2 hands)"
 
-@socketio.on('connect')
-def handle_connect():
-    client_id = request.sid
-    connected_clients[client_id] = {
-        'connected_at': time.time(),
-        'predictions_count': 0
-    }
-    print(f"🔗 Client {client_id} connected. Total clients: {len(connected_clients)}")
-    emit('connection_status', {'status': 'connected', 'message': 'Successfully connected to ASL detection server'})
+            if imgWhite is not None:
+                cv2.imshow("ImageWhite", imgWhite)
+                imgProcessed = imgWhite.astype('float32') / 255.0
+                imgProcessed = np.expand_dims(imgProcessed, axis=0)
+                prediction = model.predict(imgProcessed, verbose=0)[0]
+                prediction_buffer.append(prediction)
+                was_hand_detected = True
+                no_hand_start_time = None  # Reset timer when hands are detected
 
-@socketio.on('disconnect')
-def handle_disconnect():
-    client_id = request.sid
-    if client_id in connected_clients:
-        client_info = connected_clients[client_id]
-        session_duration = time.time() - client_info['connected_at']
-        print(f"🔌 Client {client_id} disconnected. Session duration: {session_duration:.1f}s, Predictions: {client_info['predictions_count']}")
-        del connected_clients[client_id]
+        else:
+            # No hands detected
+            prediction_buffer.clear()
+            blank_img = np.ones((imgSize, imgSize, 3), np.uint8) * 255
+            cv2.imshow("ImageWhite", blank_img)
+            if was_hand_detected:
+                if no_hand_start_time is None:
+                    no_hand_start_time = time.time()  # Start timer
+                elif time.time() - no_hand_start_time >= no_hand_delay:
+                    if predicted_labels:
+                        labels_to_speak = predicted_labels.copy()
+                        threading.Thread(target=speak_labels, args=(labels_to_speak,), daemon=True).start()
+                        predicted_labels.clear()
+                        sequence_history.clear()
+                        last_predicted_label = None
+                        displayed_text = ""
+                    was_hand_detected = False
+                    no_hand_start_time = None
+            print("No hands detected, predicted_labels:", predicted_labels)  # Debug print
 
-@socketio.on('video_frame')
-def handle_video_frame(data):
-    client_id = request.sid
-    print(f"📷 Frame received from client {client_id}")
-    try:
-        if model is None:
-            emit('prediction_result', {
-                'error': 'Model not loaded',
-                'status': 'error'
-            })
-            return
+        if len(prediction_buffer) == 5:
+            avg_prediction = np.mean(prediction_buffer, axis=0)
+            predicted_class = np.argmax(avg_prediction)
+            confidence = avg_prediction[predicted_class]
+            model_pred = labels[predicted_class]
 
-        image_data = data['image']
-        encoded_data = image_data.split(',')[1] if ',' in image_data else image_data
-        np_data = np.frombuffer(base64.b64decode(encoded_data), np.uint8)
-        print(f"Decoded frame size: {len(np_data)} bytes")
-        frame = cv2.imdecode(np_data, cv2.IMREAD_COLOR)
+            display_label = None
+            current_time = time.time()
 
-        if frame is None or frame.size == 0:
-            print("Invalid frame received")
-            emit('prediction_result', {
-                'error': 'Invalid frame data',
-                'status': 'error'
-            })
-            return
+            if model_pred != last_predicted_label or (current_time - last_prediction_time) > min_time_gap:
+                if confidence > 0.7:
+                    sequence_history.append((model_pred, current_time))
 
-        # Resize frame to 640x480 to reduce processing load
-        frame = cv2.resize(frame, (640, 480))
+                    # forget1 -> forget2
+                    forget1_time = None
+                    for label, t in sequence_history:
+                        if label == 'forget1':
+                            forget1_time = t
+                        elif label == 'forget2' and forget1_time and t > forget1_time:
+                            display_label = 'forget'
+                            sequence_history.clear()
+                            break
 
-        # Log raw frame properties
-        print(f"Raw frame shape: {frame.shape}, dtype: {frame.dtype}, mean pixel: {np.mean(frame):.1f}")
+                    # done1 -> done2
+                    if not display_label:
+                        done1_time = None
+                        for label, t in sequence_history:
+                            if label == 'done1':
+                                done1_time = t
+                            elif label == 'done2' and done1_time and t > done1_time:
+                                display_label = 'done'
+                                sequence_history.clear()
+                                break
 
-        hand_img, bbox, contour_area = detect_hands(frame)
+                    
 
-        if hand_img is None:
-            emit('prediction_result', {
-                'label': 'No hand detected',
-                'confidence': 0.0,
-                'status': 'no_hand',
-                'frame_size': frame.shape[:2]
-            })
-            return
+                    if not display_label and model_pred in [ 'happy', 'help', 'hi', 'how are', 'i', 'love', 'need','nice','to meet','you']:
+                        display_label = model_pred
 
-        processed_img = preprocess_hand(hand_img)
-        if processed_img is None:
-            emit('prediction_result', {
-                'error': 'Preprocessing failed',
-                'status': 'error'
-            })
-            return
+                    if display_label and confidence > 0.7:
+                        info += f" | Predicted: {display_label} ({confidence:.2f})"
+                        if display_label not in predicted_labels:
+                            predicted_labels.append(display_label)
+                            print(f"Added to predicted_labels: {display_label}")  # Debug print
+                        displayed_text = " ".join(predicted_labels)
+                        last_predicted_label = model_pred
+                        last_prediction_time = current_time
 
-        prediction = model.predict(processed_img, verbose=0)[0]
-        max_index = np.argmax(prediction)
-        label = class_names[max_index]
-        confidence = float(prediction[max_index])
-        print(f"Predicted: {label} with confidence {confidence:.2f}, Top 3: {sorted([(class_names[i], float(prediction[i])) for i in range(len(class_names))], key=lambda x: x[1], reverse=True)[:3]}")
+        elif len(prediction_buffer) > 0:
+            info += " | Collecting predictions..."
 
-        if client_id in connected_clients:
-            connected_clients[client_id]['predictions_count'] += 1
+        # Calculate and display FPS
+        current_time = time.time()
+        fps = 1 / (current_time - prev_time) if current_time != prev_time else 0
+        prev_time = current_time
+        fps_text = f"FPS: {fps:.2f}"
 
-        emit('prediction_result', {
-            'label': label,
-            'confidence': confidence,
-            'status': 'success',
-            'bbox': bbox,
-            'contour_area': int(contour_area),
-            'hand_size': hand_img.shape[:2],
-            'frame_size': frame.shape[:2],
-            'all_predictions': [
-                {
-                    'class': class_names[i],
-                    'confidence': float(prediction[i])
-                } for i in range(len(class_names))
-            ]
-        })
+        # Show info and displayed text
+        cv2.putText(img, info, (50, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+        cv2.putText(img, fps_text, (50, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+        if displayed_text:
+            cv2.putText(img, f"Predicted: {displayed_text}", (50, 110), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 0, 0), 2)
 
-    except Exception as e:
-        print(f"❌ Error processing frame for client {client_id}: {str(e)}")
-        emit('prediction_result', {
-            'error': str(e),
-            'status': 'error'
-        })
+        cv2.imshow("Image", img)
+        key = cv2.waitKey(1)
+        if key == 27:
+            break
 
-@socketio.on('get_server_stats')
-def handle_get_stats():
-    total_predictions = sum(client['predictions_count'] for client in connected_clients.values())
-    emit('server_stats', {
-        'connected_clients': len(connected_clients),
-        'total_predictions': total_predictions,
-        'available_classes': class_names,
-        'model_loaded': model is not None
-    })
-
-@app.route('/')
-def index():
-    return render_template('index.html')
-
-@app.route('/health')
-def health_check():
-    return {
-        'status': 'healthy',
-        'model_loaded': model is not None,
-        'connected_clients': len(connected_clients)
-    }
-
-if __name__ == '__main__':
-    print("🚀 Starting ASL Detection Server with SocketIO...")
-    print("📋 Available classes:", class_names)
-    socketio.run(app, debug=True, host='127.0.0.1', port=5000)
+finally:
+    cap.release()
+    cv2.destroyAllWindows()
