@@ -19,7 +19,7 @@ offset = 20
 imgSize = 300
 
 # Load the trained model
-model_path = r"D:\Vision\GradProjrct\asl_model_300x300_1.h5" 
+model_path = r"D:\Vision\GradProjrct\asl.h5" 
 try:
     model = keras.models.load_model(model_path)
 except Exception as e:
@@ -218,3 +218,4 @@ try:
 finally:
     cap.release()
     cv2.destroyAllWindows()
+
